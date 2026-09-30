@@ -10,7 +10,10 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+import recon_rules
+import recon_store
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "maritime_sar.db"
@@ -165,6 +168,7 @@ class MaritimeSARService:
                 CREATE INDEX IF NOT EXISTS idx_timeline_incident ON timeline(incident_id, id);
                 """
             )
+            recon_store.migrate(conn)
 
     def _audit(self, conn: sqlite3.Connection, incident_id: int | None, actor: str, action: str, details: dict[str, Any]) -> None:
         conn.execute(
@@ -327,6 +331,7 @@ class MaritimeSARService:
                 "UPDATE search_areas SET assigned_asset_id=?,status='assigned',version=version+1,updated_at=? WHERE id=?",
                 (asset_id, now, area_id),
             )
+            self._invalidate_area_recon(conn, area_id, actor)
             self._audit(conn, area["incident_id"], actor, "area.assigned", {"area_id": area_id, "asset_id": asset_id, "distance_km": round(distance, 2)})
             return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
 
@@ -406,6 +411,7 @@ class MaritimeSARService:
             areas = conn.execute("SELECT id,incident_id FROM search_areas WHERE assigned_asset_id=? AND status IN ('assigned','active')", (asset_id,)).fetchall()
             for area in areas:
                 conn.execute("UPDATE search_areas SET assigned_asset_id=NULL,status='planned',version=version+1,updated_at=? WHERE id=?", (now, area["id"]))
+                self._invalidate_area_recon(conn, area["id"], actor)
                 self._audit(conn, area["incident_id"], actor, "area.unassigned", {"area_id": area["id"], "reason": reason.strip()})
             conn.execute("UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?", (now, asset_id))
             self._audit(conn, None, actor, "asset.withdrawn", {"asset_id": asset_id, "reason": reason.strip()})
@@ -452,6 +458,7 @@ class MaritimeSARService:
             if area["assigned_asset_id"] is not None:
                 conn.execute("UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?", (utcnow(), area["assigned_asset_id"]))
             conn.execute("UPDATE search_areas SET status=?,assigned_asset_id=NULL,version=version+1,updated_at=? WHERE id=?", (outcome, utcnow(), area_id))
+            self._invalidate_area_recon(conn, area_id, actor)
             self._audit(conn, area["incident_id"], actor, "area." + outcome, {"area_id": area_id})
             return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
 
@@ -479,6 +486,63 @@ class MaritimeSARService:
             self._audit(conn, incident_id, actor, "incident.closed", {"outcome": outcome})
             return dict(conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone())
 
+    def reassign_area(self, actor: str, role: str, area_id: int, asset_id: int,
+                      expected_area_version: int | None = None, reason: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "改派搜索区域")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            area = conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone()
+            asset = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+            if not area or not asset:
+                raise DomainError("搜索区域或资源不存在", 404)
+            if area["status"] in ("completed", "abandoned"):
+                raise DomainError("搜索区域已结束，不能改派", 409)
+            if area["assigned_asset_id"] == asset_id:
+                raise DomainError("该区域已分配给此资源", 409)
+            incident = conn.execute("SELECT * FROM incidents WHERE id=?", (area["incident_id"],)).fetchone()
+            if not incident or incident["status"] not in ACTIVE_INCIDENT:
+                raise DomainError("事件当前不可改派", 409)
+            if expected_area_version is not None and area["version"] != int(expected_area_version):
+                raise DomainError("搜索区域已变化，请刷新后重试", 409)
+            if asset["status"] != "available":
+                raise DomainError("资源当前不可用", 409)
+            if incident["sea_state"] > asset["max_sea_state"]:
+                raise DomainError("海况超出资源能力", 409)
+            capabilities = json.loads(asset["capabilities"])
+            if area["kind"] not in capabilities:
+                raise DomainError("资源不具备该搜索区域能力", 409)
+            distance = haversine_km(asset["latitude"], asset["longitude"], area["center_lat"], area["center_lon"])
+            if distance > asset["range_km"]:
+                raise DomainError("搜索区域超出资源航程", 409)
+            now = utcnow()
+            old_asset_id = area["assigned_asset_id"]
+            if old_asset_id is not None:
+                conn.execute("UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?", (now, old_asset_id))
+            changed = conn.execute(
+                "UPDATE assets SET status='assigned',version=version+1,updated_at=? WHERE id=? AND status='available' AND version=?",
+                (now, asset_id, asset["version"]),
+            )
+            if changed.rowcount != 1:
+                raise DomainError("资源已被其他任务占用", 409)
+            conn.execute(
+                "UPDATE search_areas SET assigned_asset_id=?,status='assigned',version=version+1,updated_at=? WHERE id=?",
+                (asset_id, now, area_id),
+            )
+            self._invalidate_area_recon(conn, area_id, actor)
+            self._audit(conn, area["incident_id"], actor, "area.reassigned",
+                        {"area_id": area_id, "from_asset_id": old_asset_id, "to_asset_id": asset_id,
+                         "reason": reason.strip(), "distance_km": round(distance, 2)})
+            return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
+
+    def _invalidate_area_recon(self, conn: sqlite3.Connection, area_id: int, actor: str) -> None:
+        """区域版本变化后，已有对账结论失效，等待重新确认。"""
+        invalidated = recon_store.invalidate_area_conclusions(conn, area_id, utcnow())
+        if invalidated:
+            row = conn.execute("SELECT incident_id FROM search_areas WHERE id=?", (area_id,)).fetchone()
+            self._audit(conn, row["incident_id"] if row else None, actor, "recon.invalidated",
+                        {"area_id": area_id, "item_ids": invalidated})
+
     def merge_offline_batch(self, actor: str, role: str, client_batch_id: str,
                             events: list[dict[str, Any]]) -> dict[str, Any]:
         actor = clean_actor(actor)
@@ -486,67 +550,271 @@ class MaritimeSARService:
         batch_id = client_batch_id.strip()
         if not batch_id or not isinstance(events, list):
             raise DomainError("批次编号和事件列表不能为空")
+        now = utcnow()
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            batch = recon_store.get_batch(conn, batch_id)
+            batch_row_id = batch["id"] if batch else recon_store.create_batch(conn, batch_id, actor, now)
+            conn.commit()
+            results, changed = [], False
+            for event in events:
+                outcome, is_new = self._ingest_offline_event(conn, batch_row_id, batch_id, actor, event, now)
+                results.append(outcome)
+                changed = changed or is_new
+            counts = recon_store.ledger_counts(conn, batch_row_id)
+            status = "partial" if counts["failed"] else "merged"
+            summary = {"accepted": counts["accepted"], "rejected": counts["failed"],
+                       "failed": counts["failed"], "duplicates": counts["duplicate"],
+                       "events": results}
+            conn.execute("BEGIN IMMEDIATE")
+            recon_store.finish_batch(conn, batch_row_id, status, summary, now)
+            self._audit(conn, None, actor, "offline.batch_merged",
+                        {"batch_id": batch_id, "status": status,
+                         **{k: summary[k] for k in ("accepted", "rejected", "duplicates")}})
+            conn.commit()
+            return {"batch_id": batch_id, "idempotent": not changed, "status": status, "summary": summary}
+        finally:
+            conn.close()
+
+    def _ingest_offline_event(self, conn: sqlite3.Connection, batch_row_id: int, client_batch_id: str,
+                              actor: str, event: Any, now: str) -> tuple[dict[str, Any], bool]:
+        """逐条入库：每条独立事务，部分失败不影响已接收记录，失败可单独重试。"""
+        if not isinstance(event, dict):
+            return {"client_event_id": "", "status": "failed", "error": "离线事件格式错误"}, True
+        event_id = str(event.get("client_event_id", "")).strip()
+        if not event_id:
+            return {"client_event_id": "", "status": "failed", "error": "离线事件缺少 client_event_id"}, True
+        entry = recon_store.get_ledger_entry(conn, batch_row_id, event_id)
+        if entry and entry["status"] in ("accepted", "duplicate"):
+            return {"client_event_id": event_id, "status": "duplicate", "idempotent": True,
+                    "record_id": entry["record_id"], "recon_item_id": entry["recon_item_id"]}, False
+        record_type = str(event.get("type", "")).strip()
+        duplicate_of = self._find_duplicate(conn, record_type, event_id)
+        if duplicate_of is not None:
+            record_id, recon_item_id = duplicate_of
+            conn.execute("BEGIN IMMEDIATE")
+            recon_store.ledger_write(conn, batch_row_id, client_batch_id, event_id,
+                                     record_type or "unknown", "duplicate", "", record_id, recon_item_id, now)
+            conn.commit()
+            return {"client_event_id": event_id, "status": "duplicate", "idempotent": True,
+                    "record_id": record_id, "recon_item_id": recon_item_id}, False
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if record_type == "clue":
+                record_id, recon_item_id, extra = self._merge_offline_clue(conn, actor, event, event_id), None, {}
+            elif record_type == "sweep":
+                record_id, recon_item_id, extra = self._merge_offline_sweep(conn, batch_row_id, actor, event, event_id, now)
+            elif record_type == "timeline":
+                self._merge_offline_timeline(conn, actor, event)
+                record_id, recon_item_id, extra = None, None, {}
+            else:
+                raise DomainError("不支持的离线事件类型")
+            recon_store.ledger_write(conn, batch_row_id, client_batch_id, event_id, record_type,
+                                     "accepted", "", record_id, recon_item_id, now)
+            conn.commit()
+            return {"client_event_id": event_id, "status": "accepted", "record_id": record_id,
+                    "recon_item_id": recon_item_id, **extra}, True
+        except (DomainError, KeyError, TypeError, ValueError, sqlite3.Error) as exc:
+            conn.rollback()
+            conn.execute("BEGIN IMMEDIATE")
+            recon_store.ledger_write(conn, batch_row_id, client_batch_id, event_id,
+                                     record_type or "unknown", "failed", str(exc), None, None, now)
+            conn.commit()
+            return {"client_event_id": event_id, "status": "failed", "error": str(exc)}, True
+
+    def _find_duplicate(self, conn: sqlite3.Connection, record_type: str,
+                        event_id: str) -> tuple[int | None, int | None] | None:
+        """同一记录只入一次：领域表与台账双重查重。"""
+        if record_type == "clue":
+            row = conn.execute("SELECT id FROM clues WHERE client_event_id=?", (event_id,)).fetchone()
+            return (row["id"], None) if row else None
+        if record_type == "sweep":
+            row = recon_store.get_sweep_by_event_id(conn, event_id)
+            if not row:
+                return None
+            item = recon_store.get_recon_item_by_sweep(conn, row["id"])
+            return (row["id"], item["id"] if item else None)
+        row = recon_store.find_accepted_event(conn, event_id)
+        return (row["record_id"], row["recon_item_id"]) if row else None
+
+    def _merge_offline_clue(self, conn: sqlite3.Connection, actor: str,
+                            event: dict[str, Any], event_id: str) -> int:
+        incident_id = int(event["incident_id"])
+        lat, lon = validate_position(event["latitude"], event["longitude"])
+        confidence = float(event["confidence"])
+        if not 0 <= confidence <= 1:
+            raise DomainError("置信度应在 0 到 1 之间")
+        incident = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
+        if not incident:
+            raise DomainError("事件不存在", 404)
+        if incident["status"] in CLOSED_INCIDENT:
+            raise DomainError("已结束事件不能新增线索", 409)
+        area_id = event.get("area_id")
+        if area_id is not None and not conn.execute(
+            "SELECT 1 FROM search_areas WHERE id=? AND incident_id=?", (area_id, incident_id)
+        ).fetchone():
+            raise DomainError("搜索区域不属于该事件", 409)
+        distance = haversine_km(incident["latitude"], incident["longitude"], lat, lon)
+        status = "unverified" if distance <= incident["uncertainty_km"] * 3 else "invalid"
+        cur = conn.execute(
+            """INSERT INTO clues(incident_id,area_id,client_event_id,latitude,longitude,confidence,source,status,
+               distance_from_incident_km,reporter,details,recorded_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (incident_id, area_id, event_id, lat, lon, confidence,
+             str(event.get("source", "offline")).strip(), status, distance, actor,
+             str(event.get("details", "")).strip(), utcnow()),
+        )
+        self._audit(conn, incident_id, actor, "clue.recorded", {"clue_id": cur.lastrowid, "status": status, "event_id": event_id})
+        return int(cur.lastrowid)
+
+    def _merge_offline_sweep(self, conn: sqlite3.Connection, batch_row_id: int, actor: str,
+                             event: dict[str, Any], event_id: str, now: str) -> tuple[int, int | None, dict[str, Any]]:
+        try:
+            incident_id = int(event["incident_id"])
+            area_id = int(event["area_id"])
+            area_version = int(event["area_version"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DomainError("扫测记录缺少必要字段或格式错误") from exc
+        asset_id = event.get("asset_id")
+        try:
+            asset_id = int(asset_id) if asset_id is not None else None
+        except (TypeError, ValueError) as exc:
+            raise DomainError("扫测记录的资源编号无效") from exc
+        incident = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
+        area = conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone()
+        asset = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone() if asset_id is not None else None
+        record = {"incident_id": incident_id, "area_id": area_id, "area_version": area_version,
+                  "asset_id": asset_id, "coverage_pct": event.get("coverage_pct")}
+        decision = recon_rules.evaluate_sweep(
+            record,
+            incident=dict(incident) if incident else None,
+            area=dict(area) if area else None,
+            asset=dict(asset) if asset else None,
+        )
+        if decision["verdict"] == "reject":
+            raise DomainError(decision["reasons"][0]["message"])
+        coverage = float(event["coverage_pct"])
+        merged = decision["verdict"] == "merge"
+        sweep_id = recon_store.insert_sweep(
+            conn, client_event_id=event_id, batch_id=batch_row_id, incident_id=incident_id,
+            area_id=area_id, asset_id=asset_id, area_version=area_version, coverage_pct=coverage,
+            swept_at=str(event.get("swept_at", "")).strip() or now,
+            notes=str(event.get("notes", "")).strip(), actor=actor,
+            recon_status="merged" if merged else "pending_review",
+            applied=1 if merged else 0, now=now,
+        )
+        recon_item_id = None
+        if merged:
+            recon_store.apply_coverage(conn, area_id, coverage, now)
+            self._audit(conn, incident_id, actor, "sweep.merged",
+                        {"sweep_id": sweep_id, "area_id": area_id, "coverage_pct": coverage, "event_id": event_id})
+        else:
+            recon_item_id = recon_store.insert_recon_item(
+                conn, sweep_record_id=sweep_id, client_event_id=event_id, incident_id=incident_id,
+                area_id=area_id, area_version_recorded=area_version,
+                area_version_checked=area["version"] if area else None,
+                reasons=decision["reasons"], now=now,
+            )
+            self._audit(conn, incident_id, actor, "sweep.pending_review",
+                        {"sweep_id": sweep_id, "recon_item_id": recon_item_id,
+                         "reasons": [r["code"] for r in decision["reasons"]], "event_id": event_id})
+        return sweep_id, recon_item_id, {"recon_status": "merged" if merged else "pending_review"}
+
+    def _merge_offline_timeline(self, conn: sqlite3.Connection, actor: str, event: dict[str, Any]) -> None:
+        incident_id = int(event["incident_id"])
+        if not conn.execute("SELECT 1 FROM incidents WHERE id=?", (incident_id,)).fetchone():
+            raise DomainError("事件不存在", 404)
+        self._audit(conn, incident_id, actor, event.get("action", "offline.note"), event.get("details", {}))
+
+    def list_recon_items(self, actor: str = "", role: str = "viewer",
+                         incident_id: Any = None, status: str | None = None) -> list[dict[str, Any]]:
+        if incident_id in (None, ""):
+            incident_id = None
+        else:
+            incident_id = int(incident_id)
+        if not status:
+            status = None
+        with self.connect() as conn:
+            return [self._recon_view(conn, item) for item in recon_store.list_recon_items(conn, incident_id, status)]
+
+    def _recon_view(self, conn: sqlite3.Connection, item: dict[str, Any]) -> dict[str, Any]:
+        """对账项视图：两端值、差异原因，并按当前状态重算待复核项的差异。"""
+        view = dict(item)
+        view["reasons"] = json.loads(item["reasons"])
+        sweep = recon_store.get_sweep(conn, item["sweep_record_id"])
+        view["sweep"] = sweep
+        area = None
+        if item["area_id"] is not None:
+            row = conn.execute("SELECT * FROM search_areas WHERE id=?", (item["area_id"],)).fetchone()
+            area = dict(row) if row else None
+        view["area_version_current"] = area["version"] if area else None
+        if item["status"] in ("pending_review", "stale") and sweep is not None:
+            incident_row = conn.execute("SELECT * FROM incidents WHERE id=?", (item["incident_id"],)).fetchone()
+            asset_row = None
+            if sweep["asset_id"] is not None:
+                asset_row = conn.execute("SELECT * FROM assets WHERE id=?", (sweep["asset_id"],)).fetchone()
+            record = {"incident_id": item["incident_id"], "area_id": item["area_id"],
+                      "area_version": sweep["area_version"], "asset_id": sweep["asset_id"],
+                      "coverage_pct": sweep["coverage_pct"]}
+            view["current_reasons"] = recon_rules.evaluate_sweep(
+                record,
+                incident=dict(incident_row) if incident_row else None,
+                area=area,
+                asset=dict(asset_row) if asset_row else None,
+            )["reasons"]
+        return view
+
+    def resolve_recon_item(self, actor: str, role: str, item_id: int, decision: str,
+                           note: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "复核对账项")
+        if decision not in ("confirmed", "dismissed"):
+            raise DomainError("复核结论无效")
+        now = utcnow()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            existing = conn.execute("SELECT * FROM offline_batches WHERE client_batch_id=?", (batch_id,)).fetchone()
-            if existing:
-                return {"batch_id": batch_id, "idempotent": True, "status": existing["status"], "summary": json.loads(existing["summary"])}
-            results = []
-            for event in events:
-                event_id = str(event.get("client_event_id", "")).strip()
-                try:
-                    if not event_id:
-                        raise DomainError("离线事件缺少 client_event_id")
-                    if event.get("type") == "clue":
-                        existing_clue = conn.execute("SELECT id FROM clues WHERE client_event_id=?", (event_id,)).fetchone()
-                        if existing_clue:
-                            results.append({"client_event_id": event_id, "status": "merged", "record_id": existing_clue["id"], "idempotent": True})
-                            continue
-                        incident_id = int(event["incident_id"])
-                        lat, lon = validate_position(event["latitude"], event["longitude"])
-                        confidence = float(event["confidence"])
-                        if not 0 <= confidence <= 1:
-                            raise DomainError("置信度应在 0 到 1 之间")
-                        incident = conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
-                        if not incident:
-                            raise DomainError("事件不存在", 404)
-                        if incident["status"] in CLOSED_INCIDENT:
-                            raise DomainError("已结束事件不能新增线索", 409)
-                        area_id = event.get("area_id")
-                        if area_id is not None and not conn.execute(
-                            "SELECT 1 FROM search_areas WHERE id=? AND incident_id=?", (area_id, incident_id)
-                        ).fetchone():
-                            raise DomainError("搜索区域不属于该事件", 409)
-                        distance = haversine_km(incident["latitude"], incident["longitude"], lat, lon)
-                        status = "unverified" if distance <= incident["uncertainty_km"] * 3 else "invalid"
-                        cur = conn.execute(
-                            """INSERT INTO clues(incident_id,area_id,client_event_id,latitude,longitude,confidence,source,status,
-                               distance_from_incident_km,reporter,details,recorded_at)
-                               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (incident_id, area_id, event_id, lat, lon, confidence,
-                             str(event.get("source", "offline")).strip(), status, distance, actor,
-                             str(event.get("details", "")).strip(), utcnow()),
-                        )
-                        self._audit(conn, incident_id, actor, "clue.recorded", {"clue_id": cur.lastrowid, "status": status, "event_id": event_id})
-                        results.append({"client_event_id": event_id, "status": "merged", "record_id": cur.lastrowid})
-                    elif event.get("type") == "timeline":
-                        incident_id = int(event["incident_id"])
-                        if not conn.execute("SELECT 1 FROM incidents WHERE id=?", (incident_id,)).fetchone():
-                            raise DomainError("事件不存在", 404)
-                        self._audit(conn, incident_id, actor, event.get("action", "offline.note"), event.get("details", {}))
-                        results.append({"client_event_id": event_id, "status": "merged", "record_id": None})
-                    else:
-                        raise DomainError("不支持的离线事件类型")
-                except (DomainError, KeyError, TypeError, ValueError) as exc:
-                    results.append({"client_event_id": event_id, "status": "rejected", "error": str(exc)})
-            summary = {"accepted": sum(1 for item in results if item["status"] == "merged"), "rejected": sum(1 for item in results if item["status"] == "rejected"), "events": results}
-            now = utcnow()
-            conn.execute(
-                "INSERT INTO offline_batches(client_batch_id,actor,status,received_at,merged_at,summary) VALUES(?,?,?,?,?,?)",
-                (batch_id, actor, "merged", now, now, json_dump(summary)),
-            )
-            self._audit(conn, None, actor, "offline.batch_merged", {"batch_id": batch_id, **{k: summary[k] for k in ("accepted", "rejected")}})
-            return {"batch_id": batch_id, "idempotent": False, "status": "merged", "summary": summary}
+            item = recon_store.get_recon_item(conn, int(item_id))
+            if not item:
+                raise DomainError("对账项不存在", 404)
+            if item["status"] not in ("pending_review", "stale"):
+                raise DomainError("该对账项已有结论，区域版本变化后才能重新确认", 409)
+            sweep = recon_store.get_sweep(conn, item["sweep_record_id"])
+            area = None
+            if item["area_id"] is not None:
+                area = conn.execute("SELECT * FROM search_areas WHERE id=?", (item["area_id"],)).fetchone()
+            incident = conn.execute("SELECT * FROM incidents WHERE id=?", (item["incident_id"],)).fetchone()
+            applied = bool(sweep["applied"])
+            if decision == "confirmed":
+                if not applied and area and area["status"] not in ("completed", "abandoned") \
+                        and incident and incident["status"] in ACTIVE_INCIDENT:
+                    recon_store.apply_coverage(conn, area["id"], sweep["coverage_pct"], now)
+                    applied = True
+            recon_store.set_sweep_recon_status(conn, sweep["id"], decision, 1 if applied else 0, now)
+            recon_store.resolve_item(conn, item["id"], decision, actor, note.strip(),
+                                     area["version"] if area else None, now)
+            self._audit(conn, item["incident_id"], actor, "recon.resolved",
+                        {"item_id": item["id"], "decision": decision,
+                         "coverage_applied": applied, "note": note.strip()})
+            return self._recon_view(conn, recon_store.get_recon_item(conn, item["id"]))
+
+    @staticmethod
+    def _batch_view(row: dict[str, Any]) -> dict[str, Any]:
+        batch = dict(row)
+        try:
+            batch["summary"] = json.loads(batch["summary"])
+        except (ValueError, TypeError):
+            pass
+        return batch
+
+    def list_offline_batches(self, actor: str = "", role: str = "viewer") -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return [self._batch_view(row) for row in recon_store.list_batches(conn)]
+
+    def list_offline_records(self, actor: str = "", role: str = "viewer",
+                             client_batch_id: str | None = None) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return recon_store.list_ledger(conn, client_batch_id)
 
     def state(self, actor: str = "", role: str = "viewer") -> dict[str, Any]:
         with self.connect() as conn:
@@ -555,7 +823,12 @@ class MaritimeSARService:
             clues = [dict(r) for r in conn.execute("SELECT * FROM clues ORDER BY id DESC LIMIT 200").fetchall()]
             assets = [dict(r) for r in conn.execute("SELECT * FROM assets ORDER BY id").fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 300").fetchall()]
-        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues, "timeline": timeline}
+            sweeps = recon_store.list_sweeps(conn)
+            recon_items = [self._recon_view(conn, item) for item in recon_store.list_recon_items(conn)]
+            batches = [self._batch_view(row) for row in recon_store.list_batches(conn)]
+        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues,
+                "timeline": timeline, "sweep_records": sweeps, "recon_items": recon_items,
+                "offline_batches": batches}
 
     def incident_timeline(self, incident_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -625,6 +898,22 @@ class ApiHandler(BaseHTTPRequestHandler):
                 incident_id = int(path.split("/")[3])
                 self._send(200, {"timeline": self.service.incident_timeline(incident_id)})
                 return
+            if path == "/api/recon":
+                query = parse_qs(urlparse(self.path).query)
+                self._send(200, {"items": self.service.list_recon_items(
+                    *self._actor(),
+                    incident_id=query.get("incident_id", [None])[0],
+                    status=query.get("status", [None])[0],
+                )})
+                return
+            if path == "/api/offline/batches":
+                self._send(200, {"batches": self.service.list_offline_batches(*self._actor())})
+                return
+            if path == "/api/offline/records":
+                query = parse_qs(urlparse(self.path).query)
+                self._send(200, {"records": self.service.list_offline_records(
+                    *self._actor(), client_batch_id=query.get("batch", [None])[0])})
+                return
             self._send(404, {"error": "接口不存在"})
         except (DomainError, ValueError) as exc:
             self._send(getattr(exc, "status", 400), {"error": str(exc)})
@@ -649,6 +938,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.withdraw_asset(actor, role, **data)
             elif path == "/api/areas/complete":
                 result = self.service.complete_area(actor, role, **data)
+            elif path == "/api/areas/reassign":
+                result = self.service.reassign_area(actor, role, **data)
+            elif path == "/api/recon/resolve":
+                result = self.service.resolve_recon_item(actor, role, **data)
             elif path == "/api/incidents/transfer":
                 result = self.service.transfer_incident(actor, role, **data)
             elif path == "/api/incidents/close":
