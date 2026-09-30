@@ -1,0 +1,11 @@
+{
+  "projectId": "pair-wise-gsb-40",
+  "projectName": "pair-wise-gsb-40",
+  "category": "地狱 Python 项目",
+  "businessDomain": "海上搜救",
+  "projectForm": "完整项目",
+  "codeScope": "backend, frontend",
+  "languages": ["Python", "HTML", "CSS", "JavaScript"],
+  "summary": "海上搜救事件、资源分配、搜索区域、线索核验和离线批次协调系统。",
+  "containerized": false
+}
