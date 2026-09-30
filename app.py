@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from recon_api import ReconAPI, ReconError
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "maritime_sar.db"
 ACTIVE_INCIDENT = {"reported", "coordinating", "recovering"}
@@ -66,7 +68,9 @@ def json_dump(value: Any) -> str:
 class MaritimeSARService:
     def __init__(self, db_path: str | os.PathLike[str] = DEFAULT_DB):
         self.db_path = str(db_path)
+        self.recon: ReconAPI | None = None
         self._init_schema()
+        self.recon = ReconAPI(self.db_path)
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10)
@@ -327,6 +331,8 @@ class MaritimeSARService:
                 "UPDATE search_areas SET assigned_asset_id=?,status='assigned',version=version+1,updated_at=? WHERE id=?",
                 (asset_id, now, area_id),
             )
+            if self.recon is not None:
+                self.recon.on_area_version_changed(conn, area_id, actor)
             self._audit(conn, area["incident_id"], actor, "area.assigned", {"area_id": area_id, "asset_id": asset_id, "distance_km": round(distance, 2)})
             return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
 
@@ -406,6 +412,8 @@ class MaritimeSARService:
             areas = conn.execute("SELECT id,incident_id FROM search_areas WHERE assigned_asset_id=? AND status IN ('assigned','active')", (asset_id,)).fetchall()
             for area in areas:
                 conn.execute("UPDATE search_areas SET assigned_asset_id=NULL,status='planned',version=version+1,updated_at=? WHERE id=?", (now, area["id"]))
+                if self.recon is not None:
+                    self.recon.on_area_version_changed(conn, area["id"], actor)
                 self._audit(conn, area["incident_id"], actor, "area.unassigned", {"area_id": area["id"], "reason": reason.strip()})
             conn.execute("UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?", (now, asset_id))
             self._audit(conn, None, actor, "asset.withdrawn", {"asset_id": asset_id, "reason": reason.strip()})
@@ -452,6 +460,8 @@ class MaritimeSARService:
             if area["assigned_asset_id"] is not None:
                 conn.execute("UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?", (utcnow(), area["assigned_asset_id"]))
             conn.execute("UPDATE search_areas SET status=?,assigned_asset_id=NULL,version=version+1,updated_at=? WHERE id=?", (outcome, utcnow(), area_id))
+            if self.recon is not None:
+                self.recon.on_area_version_changed(conn, area_id, actor)
             self._audit(conn, area["incident_id"], actor, "area." + outcome, {"area_id": area_id})
             return dict(conn.execute("SELECT * FROM search_areas WHERE id=?", (area_id,)).fetchone())
 
@@ -621,12 +631,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             if path == "/api/state":
                 self._send(200, self.service.state(*self._actor()))
                 return
+            if path == "/api/recon/status":
+                self._send(200, self.service.recon.status(*self._actor()))
+                return
             if path.startswith("/api/incidents/") and path.endswith("/timeline"):
                 incident_id = int(path.split("/")[3])
                 self._send(200, {"timeline": self.service.incident_timeline(incident_id)})
                 return
             self._send(404, {"error": "接口不存在"})
-        except (DomainError, ValueError) as exc:
+        except (DomainError, ReconError, ValueError) as exc:
             self._send(getattr(exc, "status", 400), {"error": str(exc)})
 
     def do_POST(self) -> None:
@@ -655,10 +668,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.close_incident(actor, role, **data)
             elif path == "/api/offline/batch":
                 result = self.service.merge_offline_batch(actor, role, **data)
+            elif path == "/api/recon/batch":
+                result = self.service.recon.submit_batch(actor, role, **data)
+            elif path == "/api/recon/review":
+                result = self.service.recon.review(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
-        except DomainError as exc:
+        except (DomainError, ReconError) as exc:
             self._send(exc.status, {"error": str(exc)})
         except (KeyError, TypeError, ValueError) as exc:
             self._send(400, {"error": "请求参数错误: %s" % exc})
